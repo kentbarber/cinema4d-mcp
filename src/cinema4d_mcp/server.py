@@ -2,16 +2,13 @@
 
 import socket
 import json
-import os
 import math
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional
 from contextlib import asynccontextmanager
 
 from mcp.server.fastmcp import FastMCP, Context
-from starlette.routing import Route
-from starlette.responses import JSONResponse
 
 from .config import C4D_HOST, C4D_PORT
 from .utils import logger, check_c4d_connection
@@ -56,8 +53,14 @@ def send_to_c4d(connection: C4DConnection, command: Dict[str, Any]) -> Dict[str,
     command_type = command.get("command", "")
 
     # Long-running operations need longer timeouts
-    if command_type in ["render_frame", "apply_mograph_fields"]:
-        timeout = 120  # 2 minutes for render operations
+    if command_type in [
+        "render_frame",
+        "render_preview",
+        "snapshot_scene",
+        "apply_mograph_fields",
+        "execute_python",
+    ]:
+        timeout = 120  # 2 minutes for render and heavy script operations
         logger.info(f"Using extended timeout ({timeout}s) for {command_type}")
     else:
         timeout = 20  # Default timeout for regular operations
@@ -77,7 +80,13 @@ def send_to_c4d(connection: C4DConnection, command: Dict[str, Any]) -> Dict[str,
         max_time = start_time + timeout
 
         # Log for long-running operations
-        if command_type in ["render_frame", "apply_mograph_fields"]:
+        if command_type in [
+            "render_frame",
+            "render_preview",
+            "snapshot_scene",
+            "apply_mograph_fields",
+            "execute_python",
+        ]:
             logger.info(
                 f"Waiting for response from {command_type} (timeout: {timeout}s)"
             )
@@ -101,7 +110,14 @@ def send_to_c4d(connection: C4DConnection, command: Dict[str, Any]) -> Dict[str,
                 # For long operations, log progress on data receipt
                 elapsed = time.time() - start_time
                 if (
-                    command_type in ["render_frame", "apply_mograph_fields"]
+                    command_type
+                    in [
+                        "render_frame",
+                        "render_preview",
+                        "snapshot_scene",
+                        "apply_mograph_fields",
+                        "execute_python",
+                    ]
                     and elapsed > 5
                 ):
                     logger.debug(
@@ -143,21 +159,262 @@ def send_to_c4d(connection: C4DConnection, command: Dict[str, Any]) -> Dict[str,
         return {"error": f"Communication error: {str(e)}"}
 
 
-async def homepage(request):
-    """Handle homepage requests to check if server is running."""
-    c4d_available = check_c4d_connection(C4D_HOST, C4D_PORT)
-    return JSONResponse(
-        {
-            "status": "ok",
-            "cinema4d_connected": c4d_available,
-            "host": C4D_HOST,
-            "port": C4D_PORT,
-        }
-    )
+def _fmt_vec(v):
+    """Format a vector/list as a compact string."""
+    if isinstance(v, (list, tuple)):
+        return f"({', '.join(f'{x:.1f}' if isinstance(x, float) else str(x) for x in v)})"
+    return str(v)
+
+
+def _fmt_props(d, indent="  "):
+    """Format a dict as bullet list lines."""
+    lines = []
+    for k, v in d.items():
+        label = k.replace("_", " ").title()
+        if isinstance(v, (list, tuple)) and len(v) <= 4 and all(isinstance(x, (int, float)) for x in v):
+            lines.append(f"{indent}- **{label}**: {_fmt_vec(v)}")
+        elif isinstance(v, dict):
+            lines.append(f"{indent}- **{label}**:")
+            lines.extend(_fmt_props(v, indent + "  "))
+        else:
+            lines.append(f"{indent}- **{label}**: {v}")
+    return lines
+
+
+def format_c4d_response(response: Dict[str, Any], command_type: str) -> str:
+    """Format a Cinema 4D response dict as readable markdown."""
+    if "error" in response:
+        return f"❌ Error: {response['error']}"
+
+    status = response.get("status", "ok")
+
+    if command_type == "add_primitive":
+        obj = response.get("object", {})
+        name = obj.get("name", "Object")
+        lines = [f"✅ Created **{name}**"]
+        if "type" in obj:
+            lines.append(f"  - **Type**: {obj['type']}")
+        if "position" in obj:
+            lines.append(f"  - **Position**: {_fmt_vec(obj['position'])}")
+        if "size" in obj:
+            lines.append(f"  - **Size**: {_fmt_vec(obj['size'])}")
+        if "guid" in obj:
+            lines.append(f"  - **GUID**: `{obj['guid']}`")
+        return "\n".join(lines)
+
+    elif command_type == "modify_object":
+        obj_name = response.get("object", {}).get("name", "Object")
+        modified = response.get("modified_properties", response.get("properties", {}))
+        lines = [f"✅ Modified **{obj_name}**"]
+        if isinstance(modified, dict):
+            lines.extend(_fmt_props(modified))
+        return "\n".join(lines)
+
+    elif command_type == "list_objects":
+        objects = response.get("objects", [])
+        if not objects:
+            return "Scene is empty — no objects found."
+        lines = [f"📦 **Scene Objects** ({len(objects)} total)"]
+        for obj in objects:
+            indent = "  " * obj.get("depth", 0)
+            lines.append(f"  {indent}- **{obj['name']}** ({obj.get('type', '?')})")
+        return "\n".join(lines)
+
+    elif command_type == "create_material":
+        mat = response.get("material", {})
+        name = mat.get("name", "Material")
+        lines = [f"✅ Created material **{name}**"]
+        if "color" in mat:
+            lines.append(f"  - **Color**: {_fmt_vec(mat['color'])}")
+        return "\n".join(lines)
+
+    elif command_type == "apply_material":
+        mat = response.get("material_name", response.get("material", "?"))
+        obj = response.get("object_name", response.get("object", "?"))
+        return f"✅ Applied material **{mat}** → **{obj}**"
+
+    elif command_type == "render_frame":
+        info = response.get("render_info", response)
+        lines = ["✅ Render complete"]
+        if "output_path" in info:
+            lines.append(f"  - **Output**: `{info['output_path']}`")
+        if "width" in info and "height" in info:
+            lines.append(f"  - **Resolution**: {info['width']}×{info['height']}")
+        if "render_time" in info:
+            lines.append(f"  - **Time**: {info['render_time']}")
+        return "\n".join(lines)
+
+    elif command_type == "set_keyframe":
+        lines = ["✅ Keyframe set"]
+        for key in ("object_name", "property", "value", "frame"):
+            if key in response:
+                lines.append(f"  - **{key.replace('_', ' ').title()}**: {response[key]}")
+        return "\n".join(lines)
+
+    elif command_type in ("save_scene", "load_scene"):
+        action = "Saved" if command_type == "save_scene" else "Loaded"
+        path = response.get("file_path", response.get("path", ""))
+        lines = [f"✅ {action} scene"]
+        if path:
+            lines.append(f"  - **Path**: `{path}`")
+        return "\n".join(lines)
+
+    elif command_type == "create_mograph_cloner":
+        obj = response.get("object", {})
+        name = obj.get("name", "Cloner")
+        lines = [f"✅ Created cloner **{name}**"]
+        if "mode" in obj:
+            lines.append(f"  - **Mode**: {obj['mode']}")
+        if "guid" in obj:
+            lines.append(f"  - **GUID**: `{obj['guid']}`")
+        return "\n".join(lines)
+
+    elif command_type == "add_effector":
+        obj = response.get("object", response.get("effector", {}))
+        name = obj.get("name", "Effector")
+        lines = [f"✅ Added effector **{name}**"]
+        if "type" in obj:
+            lines.append(f"  - **Type**: {obj['type']}")
+        if "applied_to" in obj:
+            lines.append(f"  - **Applied to**: {obj['applied_to']}")
+        return "\n".join(lines)
+
+    elif command_type == "apply_mograph_fields":
+        field = response.get("field", {})
+        name = field.get("name", "Field")
+        lines = [f"✅ Applied field **{name}**"]
+        if "type" in field:
+            lines.append(f"  - **Type**: {field['type']}")
+        if "applied_to" in field:
+            lines.append(f"  - **Target**: {field['applied_to']}")
+        if "strength" in field:
+            lines.append(f"  - **Strength**: {field['strength']}")
+        if "falloff" in field:
+            lines.append(f"  - **Falloff**: {field['falloff']}")
+        return "\n".join(lines)
+
+    elif command_type in ("create_soft_body", "apply_dynamics"):
+        obj_name = response.get("object_name", response.get("object", {}).get("name", "Object"))
+        dtype = response.get("type", response.get("dynamics_type", "dynamics"))
+        return f"✅ Applied **{dtype}** dynamics to **{obj_name}**"
+
+    elif command_type == "create_abstract_shape":
+        obj = response.get("object", {})
+        name = obj.get("name", "Shape")
+        lines = [f"✅ Created abstract shape **{name}**"]
+        if "type" in obj:
+            lines.append(f"  - **Type**: {obj['type']}")
+        return "\n".join(lines)
+
+    elif command_type == "create_camera":
+        cam = response.get("camera", response.get("object", {}))
+        name = cam.get("name", "Camera")
+        lines = [f"✅ Created camera **{name}**"]
+        if "position" in cam:
+            lines.append(f"  - **Position**: {_fmt_vec(cam['position'])}")
+        if "focal_length" in cam:
+            lines.append(f"  - **Focal Length**: {cam['focal_length']}mm")
+        if "guid" in cam:
+            lines.append(f"  - **GUID**: `{cam['guid']}`")
+        return "\n".join(lines)
+
+    elif command_type == "create_light":
+        obj = response.get("object", {})
+        name = obj.get("name", "Light")
+        lines = [f"✅ Created light **{name}**"]
+        if "type" in obj:
+            lines.append(f"  - **Type**: {obj['type']}")
+        return "\n".join(lines)
+
+    elif command_type == "apply_shader":
+        shader = response.get("shader", {})
+        lines = [f"✅ Applied **{shader.get('type', 'shader')}** shader"]
+        if "material" in shader:
+            lines.append(f"  - **Material**: {shader['material']}")
+        if "applied_to" in shader and shader["applied_to"] != "None":
+            lines.append(f"  - **Applied to**: {shader['applied_to']}")
+        return "\n".join(lines)
+
+    elif command_type == "animate_camera":
+        cam = response.get("camera_animation", {})
+        lines = [f"✅ Camera animation created"]
+        if "type" in cam:
+            lines.append(f"  - **Type**: {cam['type']}")
+        if "camera_name" in cam:
+            lines.append(f"  - **Camera**: {cam['camera_name']}")
+        if "frame_range" in cam:
+            lines.append(f"  - **Frame Range**: {cam['frame_range']}")
+        if "keyframe_count" in cam:
+            lines.append(f"  - **Keyframes**: {cam['keyframe_count']}")
+        return "\n".join(lines)
+
+    elif command_type == "execute_python":
+        result = response.get("result", "No output")
+        output = response.get("output", "")
+        variables = response.get("variables", {})
+        warning = response.get("warning", "")
+        lines = ["✅ Script executed successfully"]
+        if output:
+            lines.append(f"**Output:**\n```\n{output}\n```")
+        elif result and result != "No output":
+            lines.append(f"**Output:**\n```\n{result}\n```")
+        if variables:
+            vars_str = "\n".join(f"  {k}: {v}" for k, v in variables.items())
+            lines.append(f"**Variables:**\n{vars_str}")
+        if warning:
+            lines.append(f"⚠️ {warning}")
+        return "\n".join(lines) if len(lines) > 1 else "Script executed (no output)"
+
+    elif command_type == "group_objects":
+        group = response.get("group", {})
+        name = group.get("name", "Group")
+        children = group.get("children", [])
+        lines = [f"✅ Grouped into **{name}**"]
+        if children:
+            lines.append(f"  - **Children**: {', '.join(children)}")
+        return "\n".join(lines)
+
+    elif command_type == "render_preview":
+        if "image_data" not in response:
+            return "❌ No image data returned from Cinema 4D"
+        w = response.get("width", "?")
+        h = response.get("height", "?")
+        fmt = response.get("format", "png")
+        lines = [f"✅ Preview rendered ({w}×{h}, {fmt})"]
+        # Embed as base64 markdown image so Claude Code can display it
+        lines.append(f"![preview](data:image/{fmt};base64,{response['image_data']})")
+        return "\n".join(lines)
+
+    elif command_type == "snapshot_scene":
+        snap = response.get("snapshot", {})
+        lines = ["✅ Scene snapshot created"]
+        if "path" in snap:
+            lines.append(f"  - **Path**: `{snap['path']}`")
+        if "timestamp" in snap:
+            lines.append(f"  - **Timestamp**: {snap['timestamp']}")
+        if "size" in snap:
+            lines.append(f"  - **Size**: {snap['size']}")
+        if "assets" in snap:
+            lines.append(f"  - **Assets**: {len(snap['assets'])}")
+        return "\n".join(lines)
+
+    # Fallback: format the dict generically
+    lines = [f"✅ {status}"]
+    for k, v in response.items():
+        if k == "status":
+            continue
+        if isinstance(v, dict):
+            lines.append(f"  - **{k.replace('_', ' ').title()}**:")
+            lines.extend(_fmt_props(v, "    "))
+        elif isinstance(v, list) and len(v) > 0 and isinstance(v[0], dict):
+            lines.append(f"  - **{k.replace('_', ' ').title()}**: ({len(v)} items)")
+        else:
+            lines.append(f"  - **{k.replace('_', ' ').title()}**: {v}")
+    return "\n".join(lines)
 
 
 # Initialize our FastMCP server
-mcp = FastMCP(title="Cinema4D", routes=[Route("/", endpoint=homepage)])
+mcp = FastMCP(name="Cinema4D")
 
 
 @mcp.tool()
@@ -222,12 +479,7 @@ async def add_primitive(
 
         # Send command to Cinema 4D
         response = send_to_c4d(connection, command)
-
-        if "error" in response:
-            return f"❌ Error: {response['error']}"
-
-        object_info = response.get("object", {})
-        return response
+        return format_c4d_response(response, "add_primitive")
 
 
 @mcp.tool()
@@ -255,41 +507,22 @@ async def modify_object(
             },
         )
 
-        if "error" in response:
-            return f"❌ Error: {response['error']}"
-
-        # Generate summary of what was modified
-        modified_props = []
-        for prop, value in properties.items():
-            modified_props.append(f"- **{prop}**: {value}")
-
-        return response
+        return format_c4d_response(response, "modify_object")
 
 
 @mcp.tool()
 async def list_objects(ctx: Context) -> str:
-    """List all objects in the current Cinema 4D scene."""
+    """List all objects in the current Cinema 4D scene.
+
+    If this tool returns a validation error, use execute_python_script as a fallback
+    to traverse the object hierarchy manually via the c4d API.
+    """
     async with c4d_connection_context() as connection:
         if not connection.connected:
             return "❌ Not connected to Cinema 4D"
 
         response = send_to_c4d(connection, {"command": "list_objects"})
-
-        if "error" in response:
-            return f"❌ Error: {response['error']}"
-
-        objects = response.get("objects", [])
-        if not objects:
-            return "No objects found in the scene."
-
-        # Format objects as a hierarchical list with indentation
-        object_list = []
-        for obj in objects:
-            # Calculate indentation based on object's depth in hierarchy
-            indent = "  " * obj.get("depth", 0)
-            object_list.append(f"{indent}- **{obj['name']}** ({obj['type']})")
-
-        return response
+        return format_c4d_response(response, "list_objects")
 
 
 @mcp.tool()
@@ -321,12 +554,7 @@ async def create_material(
 
         # Send command to Cinema 4D
         response = send_to_c4d(connection, command)
-
-        if "error" in response:
-            return f"❌ Error: {response['error']}"
-
-        material_info = response.get("material", {})
-        return response
+        return format_c4d_response(response, "create_material")
 
 
 @mcp.tool()
@@ -351,11 +579,57 @@ async def apply_material(material_name: str, object_name: str, ctx: Context) -> 
                 "object_name": object_name,
             },
         )
+        return format_c4d_response(response, "apply_material")
+
+
+@mcp.tool()
+async def inspect_redshift_materials(
+    material_name: Optional[str] = None,
+    include_assignments: bool = True,
+    include_preview: bool = True,
+    include_description: bool = True,
+    include_container: bool = True,
+    include_graph: bool = True,
+    ctx: Context = None,
+) -> str:
+    """
+    Inspect Redshift materials with best-effort fallbacks.
+
+    This tool is read-only and is designed to be useful even when the Redshift
+    Python runtime is unavailable. It can still report names, assignments,
+    preview-derived colors, readable description/container fields, and will
+    attempt graph inspection only when Cinema 4D exposes that data.
+
+    Args:
+        material_name: Optional material name filter
+        include_assignments: Include texture-tag assignments in the scene
+        include_preview: Include sampled preview bitmap color data
+        include_description: Include readable description entries
+        include_container: Include safe BaseContainer values
+        include_graph: Attempt node-graph inspection when available
+    """
+    async with c4d_connection_context() as connection:
+        if not connection.connected:
+            return "❌ Not connected to Cinema 4D"
+
+        command = {
+            "command": "inspect_redshift_materials",
+            "include_assignments": include_assignments,
+            "include_preview": include_preview,
+            "include_description": include_description,
+            "include_container": include_container,
+            "include_graph": include_graph,
+        }
+
+        if material_name:
+            command["material_name"] = material_name
+
+        response = send_to_c4d(connection, command)
 
         if "error" in response:
             return f"❌ Error: {response['error']}"
 
-        return response
+        return json.dumps(response, indent=2)
 
 
 @mcp.tool()
@@ -389,12 +663,7 @@ async def render_frame(
 
         # Send command to Cinema 4D
         response = send_to_c4d(connection, command)
-
-        if "error" in response:
-            return f"❌ Error: {response['error']}"
-
-        render_info = response.get("render_info", {})
-        return response
+        return format_c4d_response(response, "render_frame")
 
 
 @mcp.tool()
@@ -425,11 +694,7 @@ async def set_keyframe(
                 "frame": frame,
             },
         )
-
-        if "error" in response:
-            return f"❌ Error: {response['error']}"
-
-        return response
+        return format_c4d_response(response, "set_keyframe")
 
 
 @mcp.tool()
@@ -452,11 +717,7 @@ async def save_scene(file_path: Optional[str] = None, ctx: Context = None) -> st
 
         # Send command to Cinema 4D
         response = send_to_c4d(connection, command)
-
-        if "error" in response:
-            return f"❌ Error: {response['error']}"
-
-        return response
+        return format_c4d_response(response, "save_scene")
 
 
 @mcp.tool()
@@ -475,11 +736,7 @@ async def load_scene(file_path: str, ctx: Context) -> str:
         response = send_to_c4d(
             connection, {"command": "load_scene", "file_path": file_path}
         )
-
-        if "error" in response:
-            return f"❌ Error: {response['error']}"
-
-        return response
+        return format_c4d_response(response, "load_scene")
 
 
 @mcp.tool()
@@ -503,12 +760,7 @@ async def create_mograph_cloner(
             command["cloner_name"] = name
 
         response = send_to_c4d(connection, command)
-
-        if "error" in response:
-            return f"❌ Error: {response['error']}"
-
-        object_info = response.get("object", {})
-        return response
+        return format_c4d_response(response, "create_mograph_cloner")
 
 
 @mcp.tool()
@@ -539,12 +791,7 @@ async def add_effector(
             command["cloner_name"] = target
 
         response = send_to_c4d(connection, command)
-
-        if "error" in response:
-            return f"❌ Error: {response['error']}"
-
-        object_info = response.get("object", {})
-        return response
+        return format_c4d_response(response, "add_effector")
 
 
 @mcp.tool()
@@ -587,27 +834,9 @@ async def apply_mograph_fields(
         # Send the command to Cinema 4D
         response = send_to_c4d(connection, command)
 
-        # Handle error responses
         if "error" in response:
-            error_msg = response["error"]
-            logger.error(f"Error applying field: {error_msg}")
-            return f"❌ Error: {error_msg}"
-
-        # Extract field info from response
-        field_info = response.get("field", {})
-
-        # Build a response message
-        field_name = field_info.get("name", f"{field_type.capitalize()} Field")
-        applied_to = field_info.get("applied_to", "None")
-
-        # Additional parameters if available
-        params_info = ""
-        if "strength" in field_info:
-            params_info += f"\n- **Strength**: {field_info.get('strength')}"
-        if "falloff" in field_info:
-            params_info += f"\n- **Falloff**: {field_info.get('falloff')}"
-
-        return response
+            logger.error(f"Error applying field: {response['error']}")
+        return format_c4d_response(response, "apply_mograph_fields")
 
 
 @mcp.tool()
@@ -625,11 +854,7 @@ async def create_soft_body(object_name: str, ctx: Context = None) -> str:
         response = send_to_c4d(
             connection, {"command": "create_soft_body", "object_name": object_name}
         )
-
-        if "error" in response:
-            return f"❌ Error: {response['error']}"
-
-        return response
+        return format_c4d_response(response, "create_soft_body")
 
 
 @mcp.tool()
@@ -655,11 +880,7 @@ async def apply_dynamics(
                 "type": dynamics_type,
             },
         )
-
-        if "error" in response:
-            return f"❌ Error: {response['error']}"
-
-        return response
+        return format_c4d_response(response, "apply_dynamics")
 
 
 @mcp.tool()
@@ -683,12 +904,7 @@ async def create_abstract_shape(
             command["object_name"] = name
 
         response = send_to_c4d(connection, command)
-
-        if "error" in response:
-            return f"❌ Error: {response['error']}"
-
-        object_info = response.get("object", {})
-        return response
+        return format_c4d_response(response, "create_abstract_shape")
 
 
 @mcp.tool()
@@ -697,7 +913,7 @@ async def create_camera(
     position: Optional[List[float]] = None,
     properties: Optional[Dict[str, Any]] = None,
     ctx: Context = None,
-) -> Dict[str, Any]:
+) -> str:
     """
     Create a new camera in the scene.
 
@@ -706,13 +922,11 @@ async def create_camera(
         position: Optional [x, y, z] position.
         properties: Optional dictionary of camera properties (e.g., {"focal_length": 50}).
     """
-    # Generate a default name if none provided - use the name from the plugin side if needed
     requested_name = name
 
     async with c4d_connection_context() as connection:
         if not connection.connected:
-            # Return error as dictionary for consistency
-            return {"error": "❌ Not connected to Cinema 4D"}
+            return "❌ Not connected to Cinema 4D"
 
         command = {"command": "create_camera"}
         if requested_name:
@@ -725,8 +939,7 @@ async def create_camera(
             command["properties"] = properties
 
         response = send_to_c4d(connection, command)
-
-        return response
+        return format_c4d_response(response, "create_camera")
 
 
 @mcp.tool()
@@ -750,12 +963,7 @@ async def create_light(
             command["object_name"] = name
 
         response = send_to_c4d(connection, command)
-
-        if "error" in response:
-            return f"❌ Error: {response['error']}"
-
-        object_info = response.get("object", {})
-        return response
+        return format_c4d_response(response, "create_light")
 
 
 @mcp.tool()
@@ -786,16 +994,7 @@ async def apply_shader(
             command["object_name"] = object_name
 
         response = send_to_c4d(connection, command)
-
-        if "error" in response:
-            return f"❌ Error: {response['error']}"
-
-        shader_info = response.get("shader", {})
-        material_name = shader_info.get("material", "New Material")
-        applied_to = shader_info.get("applied_to", "None")
-        applied_msg = f" and applied to '{applied_to}'" if applied_to != "None" else ""
-
-        return response
+        return format_c4d_response(response, "apply_shader")
 
 
 @mcp.tool()
@@ -863,33 +1062,33 @@ async def animate_camera(
         # Send the command to Cinema 4D
         response = send_to_c4d(connection, command)
 
-        if "error" in response:
-            return f"❌ Error: {response['error']}"
-
-        # Get the camera animation info
-        camera_info = response.get("camera_animation", {})
-
-        # Build a response message
-        frames_info = ""
-        if "frame_range" in camera_info:
-            frames_info = (
-                f"\n- **Frame Range**: {camera_info.get('frame_range', [0, 0])}"
-            )
-
-        keyframe_info = ""
-        if "keyframe_count" in camera_info:
-            keyframe_info = f"\n- **Keyframes**: {camera_info.get('keyframe_count', 0)}"
-
-        return response
+        return format_c4d_response(response, "animate_camera")
 
 
 @mcp.tool()
 async def execute_python_script(script: str, ctx: Context) -> str:
     """
-    Execute a Python script in Cinema 4D.
+    Execute a Python script in Cinema 4D's Python environment.
+
+    This is the most reliable tool for non-trivial operations — it gives full access
+    to the c4d API and avoids wrapper/schema mismatches that can affect other tools.
 
     Args:
-        script: Python code to execute in Cinema 4D
+        script: Python code to execute in Cinema 4D. Has access to `c4d` and
+            `c4d.modules.mograph` modules.
+
+    Important usage notes:
+        - For animated/MoGraph data, always call doc.ExecutePasses() after SetTime():
+            doc.SetTime(c4d.BaseTime(frame, fps))
+            doc.ExecutePasses(None, True, True, True, c4d.BUILDFLAGS_NONE)
+        - For MoGraph/effector data, iterate frames sequentially (0..N) rather than
+          jumping directly to a later frame — sequential stepping produces more
+          faithful results.
+        - Security restrictions block certain keywords: import os, subprocess, exec(, eval(.
+          Keep scripts within the c4d API surface.
+        - For heavy operations (dense frame loops, complex MoGraph scenes), split work
+          into multiple smaller scripts rather than one large monolith.
+        - Use print() to return results — output is captured and returned.
     """
     async with c4d_connection_context() as connection:
         if not connection.connected:
@@ -899,12 +1098,7 @@ async def execute_python_script(script: str, ctx: Context) -> str:
         response = send_to_c4d(
             connection, {"command": "execute_python", "script": script}
         )
-
-        if "error" in response:
-            return f"❌ Error: {response['error']}"
-
-        result = response.get("result", "No output")
-        return response
+        return format_c4d_response(response, "execute_python")
 
 
 @mcp.tool()
@@ -930,19 +1124,7 @@ async def group_objects(
 
         # Send command to Cinema 4D
         response = send_to_c4d(connection, command)
-
-        if "error" in response:
-            return f"❌ Error: {response['error']}"
-
-        group_info = response.get("group", {})
-
-        # Format object list for display
-        objects_str = ", ".join(object_names)
-        if len(objects_str) > 50:
-            # Truncate if too long
-            objects_str = objects_str[:47] + "..."
-
-        return response
+        return format_c4d_response(response, "group_objects")
 
 
 @mcp.tool()
@@ -983,21 +1165,7 @@ async def render_preview(
         if "error" in response:
             return f"❌ Error: {response['error']}"
 
-        # Check if the response contains the base64 image data
-        if "image_data" not in response:
-            return "❌ Error: No image data returned from Cinema 4D"
-
-        # Get image dimensions
-        preview_width = response.get("width", width or "default")
-        preview_height = response.get("height", height or "default")
-
-        # Display the image using markdown
-        image_data = response["image_data"]
-        image_format = response.get("format", "png")
-
-        # Note: The plugin handler handle_render_preview was already designed
-        # to return the structure needed for image display if successful.
-        return response  # Return the raw dictionary
+        return format_c4d_response(response, "render_preview")
 
 
 @mcp.tool()
@@ -1026,23 +1194,7 @@ async def snapshot_scene(
         # Send command to Cinema 4D
         response = send_to_c4d(connection, command)
 
-        if "error" in response:
-            return f"❌ Error: {response['error']}"
-
-        snapshot_info = response.get("snapshot", {})
-
-        # Extract information
-        path = snapshot_info.get("path", file_path or "Default location")
-        size = snapshot_info.get("size", "Unknown")
-        timestamp = snapshot_info.get("timestamp", "Unknown")
-
-        # Format assets information if available
-        assets_info = ""
-        if "assets" in snapshot_info:
-            assets_count = len(snapshot_info["assets"])
-            assets_info = f"\n- **Assets Included**: {assets_count}"
-
-        return response
+        return format_c4d_response(response, "snapshot_scene")
 
 
 @mcp.resource("c4d://primitives")
