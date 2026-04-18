@@ -1,7 +1,7 @@
 """
 Cinema 4D MCP Server Plugin
 Updated for Cinema 4D R2025 compatibility
-Version 0.1.8 - Context awareness
+Version 0.1.9 - Redshift inspection
 """
 
 import c4d
@@ -103,7 +103,7 @@ class C4DSocketServer(threading.Thread):
                 timeout = 30  # 30 seconds for field operations
                 self.log(f"[C4D] Using extended timeout (30s) for field operation")
             else:
-                timeout = 15  # Default timeout increased to 15 seconds
+                timeout = 60  # Default timeout increased to 60 seconds
 
         self.log(f"[C4D] Main thread execution will timeout after {timeout}s")
 
@@ -247,6 +247,8 @@ class C4DSocketServer(threading.Thread):
                             response = self.handle_apply_material(command)
                         elif command_type == "apply_shader":
                             response = self.handle_apply_shader(command)
+                        elif command_type == "inspect_redshift_materials":
+                            response = self.handle_inspect_redshift_materials(command)
                         elif command_type == "validate_redshift_materials":
                             response = self.handle_validate_redshift_materials(command)
                         # Rendering & preview
@@ -5088,6 +5090,798 @@ class C4DSocketServer(threading.Thread):
             self.log(f"[C4D] Available materials: {', '.join(material_names)}")
 
         return None
+
+    def _is_redshift_like_material(self, mat):
+        """Return True when a material looks like a Redshift/plugin-owned material."""
+        if mat is None:
+            return False
+
+        mat_type = mat.GetType()
+        redshift_id = getattr(c4d, "ID_REDSHIFT_MATERIAL", None)
+
+        if redshift_id is not None and mat_type == redshift_id:
+            return True
+
+        # Existing scenes commonly store RS materials as high plugin IDs even when
+        # the Redshift Python module itself is unavailable.
+        return mat_type >= 1000000
+
+    def _iter_scene_objects(self, root):
+        """Yield scene objects iteratively to avoid recursion limits."""
+        stack = [root] if root else []
+
+        while stack:
+            obj = stack.pop()
+            while obj:
+                yield obj
+                child = obj.GetDown()
+                if child:
+                    stack.append(child)
+                obj = obj.GetNext()
+
+    def _descid_to_path(self, descid):
+        """Convert a DescID into a JSON-safe list of integer IDs."""
+        try:
+            return [int(descid[i].id) for i in range(descid.GetDepth())]
+        except Exception:
+            return []
+
+    def _serialize_material_value(self, value, depth=0):
+        """Best-effort serializer for C4D/Redshift material values."""
+        if value is None:
+            return None
+
+        if isinstance(value, bool):
+            return value
+
+        if isinstance(value, int):
+            return int(value)
+
+        if isinstance(value, float):
+            if math.isfinite(value):
+                return float(value)
+            return str(value)
+
+        if isinstance(value, str):
+            return value
+
+        if isinstance(value, c4d.Vector):
+            return [float(value.x), float(value.y), float(value.z)]
+
+        if isinstance(value, (list, tuple)):
+            return [self._serialize_material_value(item, depth + 1) for item in value]
+
+        if isinstance(value, c4d.BaseContainer):
+            entries = []
+            truncated = False
+            try:
+                for index, (key, child_value) in enumerate(value):
+                    if index >= 10:
+                        truncated = True
+                        break
+                    entries.append(
+                        {
+                            "key": int(key),
+                            "value": self._serialize_material_value(
+                                child_value, depth + 1
+                            ),
+                        }
+                    )
+            except Exception as exc:
+                return {
+                    "type": "BaseContainer",
+                    "error": str(exc),
+                }
+
+            return {
+                "type": "BaseContainer",
+                "entries": entries,
+                "truncated": truncated,
+            }
+
+        if isinstance(value, type):
+            return {
+                "type": "type",
+                "name": value.__name__,
+            }
+
+        return {
+            "type": type(value).__name__,
+            "repr": repr(value),
+        }
+
+    def _sample_material_preview(self, mat, grid_size=5):
+        """Sample the material preview bitmap for a representative color."""
+        try:
+            bmp = mat.GetPreview(0)
+        except Exception as exc:
+            return {"available": False, "error": str(exc)}
+
+        if bmp is None:
+            return {"available": False, "error": "no_preview"}
+
+        width = bmp.GetBw()
+        height = bmp.GetBh()
+        if width <= 0 or height <= 0:
+            return {"available": False, "error": "zero_size_preview"}
+
+        center_rgb = list(bmp.GetPixel(width // 2, height // 2))
+
+        margin_x = max(1, width // 5)
+        margin_y = max(1, height // 5)
+        x_start, x_end = margin_x, max(margin_x, width - margin_x)
+        y_start, y_end = margin_y, max(margin_y, height - margin_y)
+
+        samples = []
+        for i in range(grid_size):
+            for j in range(grid_size):
+                x = x_start + (x_end - x_start) * i // max(1, grid_size - 1)
+                y = y_start + (y_end - y_start) * j // max(1, grid_size - 1)
+                samples.append(bmp.GetPixel(x, y))
+
+        avg_r = sum(sample[0] for sample in samples) // len(samples)
+        avg_g = sum(sample[1] for sample in samples) // len(samples)
+        avg_b = sum(sample[2] for sample in samples) // len(samples)
+
+        return {
+            "available": True,
+            "size": [width, height],
+            "center_rgb": center_rgb,
+            "average_rgb": [avg_r, avg_g, avg_b],
+            "average_hex": f"#{avg_r:02x}{avg_g:02x}{avg_b:02x}",
+            "sample_count": len(samples),
+        }
+
+    def _collect_material_assignments(self, doc, material):
+        """Find all texture tags in the scene that reference a material."""
+        assignments = []
+        for obj in self._iter_scene_objects(doc.GetFirstObject()):
+            tag = obj.GetFirstTag()
+            while tag:
+                if tag.GetType() == c4d.Ttexture:
+                    try:
+                        tag_material = tag[c4d.TEXTURETAG_MATERIAL]
+                    except Exception:
+                        tag_material = None
+
+                    if tag_material == material:
+                        assignment = {"object": obj.GetName()}
+                        try:
+                            assignment["projection"] = int(
+                                tag[c4d.TEXTURETAG_PROJECTION]
+                            )
+                        except Exception:
+                            pass
+
+                        try:
+                            restriction = tag[c4d.TEXTURETAG_RESTRICTION]
+                            if restriction:
+                                assignment["restriction"] = restriction
+                        except Exception:
+                            pass
+
+                        assignments.append(assignment)
+
+                tag = tag.GetNext()
+
+        return assignments
+
+    def _collect_material_description(self, mat):
+        """Collect readable description entries for a material."""
+        entries = []
+        try:
+            description = mat.GetDescription(c4d.DESCFLAGS_DESC_0)
+        except Exception as exc:
+            return {"error": str(exc), "entries": entries}
+
+        for bc, descid, groupid in description:
+            name = ""
+            try:
+                name = bc.GetString(c4d.DESC_NAME) or ""
+            except Exception:
+                name = ""
+
+            path = self._descid_to_path(descid)
+            record = {
+                "id_path": path,
+                "id": path[0] if path else None,
+            }
+            if name:
+                record["name"] = name
+
+            try:
+                value = mat[descid]
+                serialized_value = self._serialize_material_value(value)
+                if serialized_value is not None:
+                    record["value"] = serialized_value
+            except Exception as exc:
+                record["value_error"] = str(exc)
+
+            if record.get("name") or "value" in record or "value_error" in record:
+                entries.append(record)
+
+        return {"entries": entries}
+
+    def _collect_material_container(self, mat):
+        """Collect safe values from a material's BaseContainer."""
+        container = mat.GetDataInstance()
+        if container is None:
+            return {"entries": []}
+
+        entries = []
+        try:
+            for key, value in container:
+                entries.append(
+                    {
+                        "id": int(key),
+                        "value": self._serialize_material_value(value),
+                    }
+                )
+        except Exception as exc:
+            return {
+                "entries": entries,
+                "error": str(exc),
+            }
+
+        return {"entries": entries}
+
+    def _summarize_graph_nodes(self, graph, max_nodes=25):
+        """Return a compact summary of graph nodes when a node graph is available."""
+        try:
+            import maxon
+        except Exception:
+            maxon = None
+
+        node_entries = []
+        for index, node in enumerate(graph.GetNodes()):
+            if index >= max_nodes:
+                break
+
+            entry = {"id": str(node.GetId())}
+
+            try:
+                entry["kind"] = str(node.GetKind())
+            except Exception:
+                pass
+
+            if maxon is not None:
+                try:
+                    asset_id_value = node.GetValue("net.maxon.node.attribute.assetid")
+                    if asset_id_value:
+                        asset_id = str(asset_id_value)
+                        if asset_id.startswith("(") and "," in asset_id:
+                            asset_id = asset_id[1:].split(",", 1)[0]
+                        entry["asset_id"] = asset_id
+                except Exception:
+                    pass
+
+                try:
+                    node_name = node.GetValue(maxon.NODE.BASE.NAME)
+                    if node_name is None:
+                        node_name = node.GetValue(maxon.EffectiveName)
+                    if node_name:
+                        entry["name"] = str(node_name)
+                except Exception:
+                    pass
+
+            try:
+                entry["input_count"] = len(node.GetInputs())
+            except Exception:
+                pass
+
+            try:
+                entry["output_count"] = len(node.GetOutputs())
+            except Exception:
+                pass
+
+            node_entries.append(entry)
+
+        return node_entries
+
+    def _inspect_redshift_nodespace_graph(self, mat):
+        """Try to inspect the Redshift node graph via the Maxon node-space API."""
+        graph_info = {
+            "accessible": False,
+            "candidate_spaces": [],
+            "backend": "nodespace",
+            "probe_strategy": "renderengine-style-node-material-reference",
+            "shader_network_type_match": bool(mat.CheckType(1036224)),
+        }
+
+        try:
+            import maxon
+        except Exception as exc:
+            graph_info["reason"] = f"maxon import failed: {exc}"
+            return graph_info
+
+        active_space = None
+        try:
+            active_space = c4d.GetActiveNodeSpaceId()
+        except Exception:
+            active_space = None
+
+        if active_space:
+            graph_info["active_node_space"] = str(active_space)
+
+        node_material_ref = None
+        try:
+            node_material_ref = mat.GetNodeMaterialReference()
+        except Exception as exc:
+            graph_info["node_material_reference_error"] = str(exc)
+
+        if node_material_ref is not None:
+            graph_info["node_material_reference"] = repr(node_material_ref)
+
+            for attr_name, key_name in [
+                ("IsNodeBased", "is_node_based"),
+                ("GetAllNimbusRefs", "nimbus_ref_count"),
+            ]:
+                try:
+                    attr = getattr(node_material_ref, attr_name)
+                    value = attr()
+                    if key_name == "nimbus_ref_count":
+                        value = len(value)
+                    graph_info[key_name] = value
+                except Exception:
+                    pass
+
+        wrapper_node_material = None
+        try:
+            wrapper_node_material = c4d.NodeMaterial(mat)
+            graph_info["node_material_wrapper"] = repr(wrapper_node_material)
+        except Exception as exc:
+            graph_info["node_material_wrapper_error"] = str(exc)
+
+        candidate_space_ids = []
+        for raw_space in [
+            active_space,
+            "com.redshift3d.redshift4c4d.class.nodespace",
+            "com.redshift3d.redshift.class.nodespace",
+            "net.maxon.nodespace.standard",
+        ]:
+            if raw_space is None:
+                continue
+            space_id = str(raw_space)
+            if space_id and space_id not in candidate_space_ids:
+                candidate_space_ids.append(space_id)
+
+        for space_id in candidate_space_ids:
+            candidate = {"id": space_id}
+            try:
+                maxon_space = maxon.Id(space_id)
+            except Exception as exc:
+                candidate["id_error"] = str(exc)
+                graph_info["candidate_spaces"].append(candidate)
+                continue
+
+            for label, ref in [
+                ("reference", node_material_ref),
+                ("wrapper", wrapper_node_material),
+            ]:
+                if ref is None:
+                    continue
+
+                try:
+                    candidate[f"{label}_has_space_string"] = bool(ref.HasSpace(space_id))
+                except Exception as exc:
+                    candidate[f"{label}_has_space_string_error"] = str(exc)
+
+                try:
+                    candidate[f"{label}_has_space_id"] = bool(ref.HasSpace(maxon_space))
+                except Exception as exc:
+                    candidate[f"{label}_has_space_id_error"] = str(exc)
+
+                for graph_mode, graph_arg in [("string", space_id), ("id", maxon_space)]:
+                    try:
+                        graph = ref.GetGraph(graph_arg)
+                        candidate[f"{label}_graph_{graph_mode}"] = graph is not None
+                        if graph is None:
+                            continue
+
+                        root = graph.GetRoot()
+                        nodes = self._summarize_graph_nodes(graph)
+                        candidate[f"{label}_graph_{graph_mode}_node_count"] = len(nodes)
+                        candidate[f"{label}_graph_{graph_mode}_nodes"] = nodes
+                        candidate[f"{label}_graph_{graph_mode}_root"] = (
+                            repr(root) if root else None
+                        )
+
+                        graph_info["candidate_spaces"].append(candidate)
+                        graph_info["accessible"] = True
+                        graph_info["selected_space"] = space_id
+                        graph_info["selected_probe"] = f"{label}:{graph_mode}"
+                        graph_info["node_count"] = len(nodes)
+                        graph_info["nodes"] = nodes
+                        graph_info["root"] = repr(root) if root else None
+                        return graph_info
+                    except Exception as exc:
+                        candidate[f"{label}_graph_{graph_mode}_error"] = str(exc)
+
+            try:
+                nimbus_ref = mat.GetNimbusRef(space_id)
+                candidate["nimbus_ref"] = repr(nimbus_ref)
+                candidate["nimbus_ref_available"] = nimbus_ref is not None
+            except Exception as exc:
+                candidate["nimbus_ref_error"] = str(exc)
+
+            graph_info["candidate_spaces"].append(candidate)
+
+        graph_info["reason"] = "No accessible Redshift node space found"
+        return graph_info
+
+    def _collect_graphview_port_entries(self, node):
+        """Collect GraphView port metadata and connected destination ports."""
+        port_entries = []
+        outgoing_connections = []
+
+        for direction, getter in [("input", node.GetInPorts), ("output", node.GetOutPorts)]:
+            try:
+                ports = list(getter())
+            except Exception:
+                ports = []
+
+            for port in ports:
+                entry = {
+                    "direction": direction,
+                }
+
+                try:
+                    entry["name"] = port.GetName(node)
+                except Exception as exc:
+                    entry["name_error"] = str(exc)
+
+                try:
+                    entry["main_id"] = int(port.GetMainID())
+                except Exception as exc:
+                    entry["main_id_error"] = str(exc)
+
+                try:
+                    entry["sub_id"] = int(port.GetSubID())
+                except Exception as exc:
+                    entry["sub_id_error"] = str(exc)
+
+                try:
+                    entry["connection_count"] = int(port.GetNrOfConnections())
+                except Exception:
+                    entry["connection_count"] = 0
+
+                if direction == "output":
+                    try:
+                        destination_ports = list(port.GetDestination())
+                    except Exception as exc:
+                        destination_ports = []
+                        entry["destination_error"] = str(exc)
+
+                    if destination_ports:
+                        entry["destination_count"] = len(destination_ports)
+                        outgoing_connections.append(
+                            {
+                                "from_node": node.GetName(),
+                                "from_port": entry.get("name"),
+                                "from_main_id": entry.get("main_id"),
+                                "from_sub_id": entry.get("sub_id"),
+                                "destination_ports": destination_ports,
+                            }
+                        )
+
+                port_entries.append(entry)
+
+        return port_entries, outgoing_connections
+
+    def _inspect_redshift_graphview_graph(self, mat, max_nodes=50, max_connections=200):
+        """Inspect Redshift shader graphs via the legacy GraphView API when available."""
+        graph_info = {
+            "accessible": False,
+            "backend": "redshift_graphview",
+        }
+
+        try:
+            import redshift
+        except Exception as exc:
+            graph_info["reason"] = f"redshift import failed: {exc}"
+            return graph_info
+
+        graph_info["redshift_module_imported"] = True
+
+        try:
+            graph_info["is_instance_mrsmaterial"] = bool(
+                mat.IsInstanceOf(redshift.Mrsmaterial)
+            )
+        except Exception as exc:
+            graph_info["is_instance_mrsmaterial_error"] = str(exc)
+
+        try:
+            node_master = redshift.GetRSMaterialNodeMaster(mat)
+        except Exception as exc:
+            graph_info["reason"] = f"GetRSMaterialNodeMaster failed: {exc}"
+            return graph_info
+
+        if node_master is None:
+            graph_info["reason"] = "GetRSMaterialNodeMaster returned None"
+            return graph_info
+
+        graph_info["node_master"] = repr(node_master)
+
+        try:
+            root = node_master.GetRoot()
+        except Exception as exc:
+            graph_info["reason"] = f"GvNodeMaster.GetRoot failed: {exc}"
+            return graph_info
+
+        if root is None:
+            graph_info["reason"] = "GraphView root node is missing"
+            return graph_info
+
+        graph_info["root"] = {
+            "name": root.GetName(),
+            "operator_id": int(root.GetOperatorID()),
+        }
+
+        nodes = []
+        outgoing_connections = []
+        stack = [(root, 0)]
+        nodes_truncated = False
+
+        while stack:
+            node, depth = stack.pop()
+            if node is None:
+                continue
+
+            next_node = node.GetNext()
+            if next_node is not None:
+                stack.append((next_node, depth))
+
+            child = node.GetDown()
+            if child is not None:
+                stack.append((child, depth + 1))
+
+            if len(nodes) >= max_nodes:
+                nodes_truncated = True
+                continue
+
+            node_entry = {
+                "name": node.GetName(),
+                "operator_id": int(node.GetOperatorID()),
+                "depth": depth,
+            }
+
+            try:
+                meta_class = node[c4d.GV_REDSHIFT_SHADER_META_CLASSNAME]
+                if meta_class:
+                    node_entry["meta_class"] = str(meta_class)
+            except Exception:
+                pass
+
+            port_entries, node_connections = self._collect_graphview_port_entries(node)
+            if port_entries:
+                displayed_ports = port_entries
+                if len(displayed_ports) > 8:
+                    connected_ports = [
+                        port
+                        for port in displayed_ports
+                        if port.get("connection_count", 0) > 0
+                    ]
+                    if connected_ports:
+                        displayed_ports = connected_ports[:8]
+                    else:
+                        displayed_ports = displayed_ports[:8]
+
+                    hidden_count = len(port_entries) - len(displayed_ports)
+                    if hidden_count > 0:
+                        node_entry["hidden_port_count"] = hidden_count
+
+                node_entry["ports"] = displayed_ports
+
+            outgoing_connections.extend(node_connections)
+            nodes.append(node_entry)
+
+        connections = []
+        connections_truncated = False
+        for connection in outgoing_connections:
+            for destination_port in connection["destination_ports"]:
+                if len(connections) >= max_connections:
+                    connections_truncated = True
+                    break
+
+                record = {
+                    "from_node": connection["from_node"],
+                    "from_port": connection.get("from_port"),
+                }
+
+                if connection.get("from_main_id") is not None:
+                    record["from_main_id"] = connection["from_main_id"]
+                if connection.get("from_sub_id") is not None:
+                    record["from_sub_id"] = connection["from_sub_id"]
+
+                destination_node = None
+                try:
+                    destination_node = destination_port.GetNode()
+                except Exception:
+                    destination_node = None
+
+                if destination_node is not None:
+                    try:
+                        record["to_node"] = destination_node.GetName()
+                    except Exception:
+                        pass
+
+                    try:
+                        record["to_port"] = destination_port.GetName(destination_node)
+                    except Exception:
+                        pass
+
+                try:
+                    record["to_main_id"] = int(destination_port.GetMainID())
+                except Exception:
+                    pass
+
+                try:
+                    record["to_sub_id"] = int(destination_port.GetSubID())
+                except Exception:
+                    pass
+
+                if "to_node" not in record:
+                    record["destination_ref"] = repr(destination_port)
+
+                connections.append(record)
+
+            if connections_truncated:
+                break
+
+        graph_info["accessible"] = True
+        graph_info["node_count"] = len(nodes)
+        graph_info["nodes"] = nodes
+        graph_info["connection_count"] = len(connections)
+        graph_info["connections"] = connections
+        if nodes_truncated:
+            graph_info["nodes_truncated"] = True
+        if connections_truncated:
+            graph_info["connections_truncated"] = True
+
+        return graph_info
+
+    def _inspect_redshift_graph(self, mat):
+        """Inspect the Redshift graph through node-space and GraphView backends."""
+        nodespace_info = self._inspect_redshift_nodespace_graph(mat)
+        graph_info = dict(nodespace_info)
+        graph_info["backend_attempts"] = ["nodespace"]
+
+        if nodespace_info.get("accessible"):
+            return graph_info
+
+        graph_info["nodespace"] = {
+            "accessible": nodespace_info.get("accessible", False),
+            "reason": nodespace_info.get("reason"),
+            "candidate_spaces": nodespace_info.get("candidate_spaces", []),
+        }
+
+        graphview_info = self._inspect_redshift_graphview_graph(mat)
+        graph_info["backend_attempts"].append("redshift_graphview")
+        graph_info["graphview"] = graphview_info
+
+        if graphview_info.get("accessible"):
+            graph_info["accessible"] = True
+            graph_info["backend"] = "redshift_graphview"
+            graph_info["selected_probe"] = "redshift_graphview"
+            graph_info["reason"] = "GraphView fallback succeeded after nodespace probe failed"
+            graph_info["node_count"] = graphview_info.get("node_count", 0)
+            graph_info["nodes"] = graphview_info.get("nodes", [])
+            graph_info["connection_count"] = graphview_info.get("connection_count", 0)
+            graph_info["connections"] = graphview_info.get("connections", [])
+            graph_info["root"] = graphview_info.get("root")
+            graph_info["node_master"] = graphview_info.get("node_master")
+            if graphview_info.get("nodes_truncated"):
+                graph_info["nodes_truncated"] = True
+            if graphview_info.get("connections_truncated"):
+                graph_info["connections_truncated"] = True
+            return graph_info
+
+        graph_info["backend"] = "nodespace"
+        graph_info["reason"] = (
+            "No accessible Redshift node graph found via nodespace or GraphView"
+        )
+        return graph_info
+
+    def handle_inspect_redshift_materials(self, command):
+        """Inspect Redshift-like materials with runtime-safe fallbacks."""
+        doc = c4d.documents.GetActiveDocument()
+        if not doc:
+            return {"error": "No active document"}
+
+        material_name = command.get("material_name", "")
+        include_preview = bool(command.get("include_preview", True))
+        include_assignments = bool(command.get("include_assignments", True))
+        include_description = bool(command.get("include_description", True))
+        include_container = bool(command.get("include_container", True))
+        include_graph = bool(command.get("include_graph", True))
+
+        redshift_module_available = hasattr(c4d, "modules") and hasattr(
+            c4d.modules, "redshift"
+        )
+
+        materials_to_inspect = []
+        if material_name:
+            target = self._find_material_by_name(doc, material_name)
+            if target is None:
+                return {
+                    "status": "error",
+                    "message": f"Material not found: {material_name}",
+                }
+            materials_to_inspect = [target]
+        else:
+            materials_to_inspect = list(doc.GetMaterials())
+
+        inspected_materials = []
+        skipped_materials = []
+
+        for index, mat in enumerate(materials_to_inspect):
+            if not self._is_redshift_like_material(mat):
+                skipped_materials.append(
+                    {
+                        "name": mat.GetName(),
+                        "type_id": mat.GetType(),
+                        "reason": "not_redshift_like",
+                    }
+                )
+                continue
+
+            material_info = {
+                "index": index,
+                "name": mat.GetName(),
+                "type_id": mat.GetType(),
+                "redshift_like": True,
+                "shader_network_type_match": bool(mat.CheckType(1036224)),
+            }
+
+            if include_preview:
+                material_info["preview"] = self._sample_material_preview(mat)
+
+            if include_assignments:
+                material_info["assignments"] = self._collect_material_assignments(
+                    doc, mat
+                )
+
+            description_info = None
+            if include_description:
+                description_info = self._collect_material_description(mat)
+                material_info["description"] = description_info["entries"]
+                if "error" in description_info:
+                    material_info["description_error"] = description_info["error"]
+
+            if include_container:
+                container_info = self._collect_material_container(mat)
+                material_info["container"] = container_info["entries"]
+                if "error" in container_info:
+                    material_info["container_error"] = container_info["error"]
+
+            if include_graph:
+                material_info["graph"] = self._inspect_redshift_graph(mat)
+
+            if description_info is not None:
+                for field in description_info["entries"]:
+                    if field.get("id") == 21001 and field.get("name"):
+                        material_info["output_label"] = field["name"]
+                        break
+
+            inspected_materials.append(material_info)
+
+        return {
+            "status": "ok",
+            "scene": {
+                "filename": doc.GetDocumentName(),
+                "material_count": len(doc.GetMaterials()),
+            },
+            "capabilities": {
+                "redshift_module_available": redshift_module_available,
+                "redshift_material_id": getattr(c4d, "ID_REDSHIFT_MATERIAL", None),
+                "preview_sampling": True,
+                "graph_inspection_requested": include_graph,
+                "renderengine_style_probe": True,
+                "redshift_graphview_probe": True,
+            },
+            "materials": inspected_materials,
+            "skipped_materials": skipped_materials,
+        }
 
     def handle_validate_redshift_materials(self, command):
         """Validate Redshift node materials in the scene and fix issues when possible."""
